@@ -1,0 +1,18 @@
+{
+  "name": "kof-signaling-server",
+  "version": "1.0.0",
+  "description": "鎷崇殗 KOF WebRTC signaling server 鈥?room management + SDP/ICE relay",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ws": "^8.18.0",
+    "uuid": "^10.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
