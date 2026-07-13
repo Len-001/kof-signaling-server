@@ -1,11 +1,10 @@
-// KOF Signaling Server v2 鈥?Deno KV for global shared state
-// Fixes: cross-instance room visibility + reliable message delivery
+// KOF Signaling Server v2.1 鈥?Deno KV + cross-instance message queue
+// Fix: properly cleanup rooms when host leaves + async cleanup
 
 const kv = await Deno.openKv();
 const sockets = {};
 const playerRooms = {};
 
-// Poll message queue every 300ms for cross-instance delivery
 setInterval(pollQueue, 300);
 
 Deno.serve((req) => {
@@ -24,8 +23,6 @@ Deno.serve((req) => {
       },
     });
   }
-
-  // HTTP fallback for room list
   if (url.pathname === "/rooms") return handleHttpRooms();
 
   const upgrade = req.headers.get("upgrade");
@@ -41,8 +38,8 @@ Deno.serve((req) => {
 
   client.onopen = () => console.log("+ " + playerId);
   client.onmessage = (ev) => handleMsg(playerId, ev.data);
-  client.onclose = () => cleanup(playerId);
-  client.onerror = () => cleanup(playerId);
+  client.onclose = () => { cleanup(playerId).catch(() => {}); };
+  client.onerror = () => { cleanup(playerId).catch(() => {}); };
 
   return response;
 });
@@ -81,11 +78,7 @@ async function handleMsg(playerId, raw) {
 
   if (type === "create_room") {
     const id = genCode();
-    const room = {
-      id, name: payload.name || "鎷崇殗瀵规垬", maxPlayers: 2,
-      players: [{ id: playerId, name: "鎴夸富", ready: false }],
-      state: "waiting", createdAt: Date.now(),
-    };
+    const room = { id, name: payload.name || "鎷崇殗瀵规垬", maxPlayers: 2, players: [{ id: playerId, name: "鎴夸富", ready: false }], state: "waiting", createdAt: Date.now() };
     await kv.set(["rooms", id], room);
     playerRooms[playerId] = id;
     send(playerId, { type: "room_created", payload: { roomId: id, playerId, name: room.name, players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready })) } });
@@ -132,11 +125,7 @@ async function handleMsg(playerId, raw) {
   if (type === "back_to_lobby") {
     const entry = await kv.get(["rooms", payload.roomId]);
     const room = entry.value;
-    if (room) {
-      room.state = "waiting"; (room.players || []).forEach(p => p.ready = false);
-      await kv.set(["rooms", payload.roomId], room);
-      await bcastAll(room, "back_to_lobby", { players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready })) });
-    }
+    if (room) { room.state = "waiting"; (room.players || []).forEach(p => p.ready = false); await kv.set(["rooms", payload.roomId], room); await bcastAll(room, "back_to_lobby", { players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready })) }); }
     return;
   }
 
@@ -145,17 +134,12 @@ async function handleMsg(playerId, raw) {
     return;
   }
 
-  // WebRTC signaling
   if (["webrtc_offer", "webrtc_answer", "webrtc_ice", "webrtc_ready", "char_image"].includes(type)) {
     const entry = await kv.get(["rooms", payload.roomId]);
     const room = entry.value;
     if (!room) return;
     if (payload.targetId) {
-      const extra = {};
-      if (payload.sdp) extra.sdp = payload.sdp;
-      if (payload.candidate) extra.candidate = payload.candidate;
-      if (payload.imageBase64) extra.imageBase64 = payload.imageBase64;
-      if (payload.charName) extra.charName = payload.charName;
+      const extra = {}; if (payload.sdp) extra.sdp = payload.sdp; if (payload.candidate) extra.candidate = payload.candidate; if (payload.imageBase64) extra.imageBase64 = payload.imageBase64; if (payload.charName) extra.charName = payload.charName;
       send(payload.targetId, { type, payload: { fromId: playerId, ...extra } });
     } else {
       await bcastRoom(room, playerId, type, payload);
@@ -164,29 +148,20 @@ async function handleMsg(playerId, raw) {
   }
 }
 
-function send(pid, data) {
-  const ws = sockets[pid];
-  if (ws) try { ws.send(JSON.stringify(data)); } catch { delete sockets[pid]; }
-}
+function send(pid, data) { const ws = sockets[pid]; if (ws) try { ws.send(JSON.stringify(data)); } catch { delete sockets[pid]; } }
 
 async function bcastRoom(room, excludeId, type, payload) {
   for (const p of (room.players || [])) {
     if (p.id === excludeId) continue;
-    if (sockets[p.id]) {
-      send(p.id, { type, payload });
-    } else {
-      await kv.set(["msgs", p.id, Date.now() + "_" + crypto.randomUUID().substring(0, 6)], { type, payload });
-    }
+    if (sockets[p.id]) { send(p.id, { type, payload }); }
+    else { await kv.set(["msgs", p.id, Date.now() + "_" + crypto.randomUUID().substring(0, 6)], { type, payload }); }
   }
 }
 
 async function bcastAll(room, type, payload) {
   for (const p of (room.players || [])) {
-    if (sockets[p.id]) {
-      send(p.id, { type, payload });
-    } else {
-      await kv.set(["msgs", p.id, Date.now() + "_" + crypto.randomUUID().substring(0, 6)], { type, payload });
-    }
+    if (sockets[p.id]) { send(p.id, { type, payload }); }
+    else { await kv.set(["msgs", p.id, Date.now() + "_" + crypto.randomUUID().substring(0, 6)], { type, payload }); }
   }
 }
 
@@ -197,10 +172,7 @@ async function pollQueue() {
     const key = entry.key;
     const ts = parseInt(String(key[2]).split("_")[0]);
     if (now - ts > 5000) { toDelete.push(key); continue; }
-    if (sockets[key[1]]) {
-      send(key[1], entry.value);
-      toDelete.push(key);
-    }
+    if (sockets[key[1]]) { send(key[1], entry.value); toDelete.push(key); }
   }
   for (const key of toDelete) await kv.delete(key);
 }
@@ -214,21 +186,23 @@ async function removePlayer(roomId, pid) {
   room.players.splice(idx, 1);
   if (room.players.length === 0) {
     await kv.delete(["rooms", roomId]);
+    console.log("Room deleted: " + roomId);
   } else {
     await kv.set(["rooms", roomId], room);
     await bcastAll(room, "player_left", { playerId: pid, players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready })) });
   }
 }
 
-function cleanup(pid) {
-  if (playerRooms[pid]) removePlayer(playerRooms[pid], pid).catch(() => {});
+async function cleanup(pid) {
+  if (playerRooms[pid]) {
+    await removePlayer(playerRooms[pid], pid);
+    delete playerRooms[pid];
+  }
   delete sockets[pid];
-  delete playerRooms[pid];
 }
 
 function genCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "";
-  for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  let code = ""; for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return code;
 }
