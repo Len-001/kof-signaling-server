@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: kof-signaling
+    env: node
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: NODE_ENV
+        value: production
